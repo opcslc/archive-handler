@@ -1,0 +1,53 @@
+[tool.pytest]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --cov=telegram_archive_explorer --cov-report=term-missing --cov-report=xml"
+markers = [
+    "integration: marks tests as integration tests",
+    "performance: marks tests as performance tests",
+    "security: marks tests as security tests"
+]
+
+[tool.coverage.run]
+branch = true
+source = ["telegram_archive_explorer"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "pass",
+    "raise ImportError"
+]
+ignore_errors = true
+omit = ["tests/*", "setup.py"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+include = '\.pyi?$'
+
+[tool.pylint]
+max-line-length = 100
+disable = [
+    "C0111",  # missing-docstring
+    "R0903",  # too-few-public-methods
+    "C0103",  # invalid-name
+]
+ignore = ["CVS", ".git", ".pytest_cache", "build", "dist"]
+ignore-patterns = ["test_.*?py"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm>=6.2"]
+build-backend = "setuptools.build_meta"
