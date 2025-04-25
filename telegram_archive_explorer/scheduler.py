@@ -177,11 +177,20 @@ class SchedulerConfig:
             self.config_file = get_config_dir() / "scheduler.json"
             
         self.channels = []
+        # Collection settings
         self.collection_interval = 24  # hours
+        self.max_concurrent_collections = 3  # number of channels to process concurrently
+        self.collection_timeout = 30  # minutes
+        
+        # Retry settings
         self.max_retries = 5
         self.initial_retry_delay = 5  # minutes
         self.retry_backoff_factor = 2
+        self.max_retry_delay = 120  # minutes, caps exponential backoff
+        
+        # Operation modes
         self.daemon_mode = False
+        self.prioritize_failed = True  # process failed channels first
         
         # Load configuration if file exists
         self._load_config()
@@ -306,9 +315,20 @@ class ArchiveCollectionScheduler:
             task_id: Unique identifier for the task
             error: Error message
         """
+        # Log detailed error information
+        logger.error(f"Task '{task_name}' failed: {error}", extra={
+            'task_id': task_id,
+            'error': error,
+            'retry_eligible': True
+        })
+        
         # Check if task is already in retry tracker
         retries = self.retry_tracker.get_all_retries()
         retry_info = next((r for r in retries if r['task_id'] == task_id), None)
+        
+        # Track error statistics
+        stats.increment("task_failures")
+        stats.increment(f"task_failures_{task_name.split(':')[0]}")
         
         if retry_info:
             attempt = retry_info['attempt_number']
@@ -324,7 +344,12 @@ class ArchiveCollectionScheduler:
                 logger.info(f"Scheduled retry {attempt + 1}/{self.config.max_retries} for {task_name} at {next_attempt}")
             else:
                 # Max retries exceeded
-                logger.error(f"Max retries exceeded for {task_name}. Giving up.")
+                logger.error(f"Max retries exceeded for {task_name}. Giving up.", extra={
+                    'task_id': task_id,
+                    'max_retries': self.config.max_retries,
+                    'total_duration': (datetime.now() - retry_info['added']).total_seconds()
+                })
+                stats.increment("task_failures_max_retries")
                 self.retry_tracker.remove_retry(task_id)
         else:
             # First failure, schedule first retry
@@ -405,15 +430,54 @@ class ArchiveCollectionScheduler:
         return result
     
     async def _collect_from_all_channels(self):
-        """Collect archives from all configured channels."""
+        """Collect archives from all configured channels with concurrent processing."""
         logger.info(f"Starting collection from {len(self.config.channels)} channels")
         
-        for channel in self.config.channels:
+        # Sort channels - failed ones first if configured
+        channels = self.config.channels.copy()
+        if self.config.prioritize_failed:
+            failed_channels = {r['task_name'].split(':')[1] for r in self.retry_tracker.get_all_retries()}
+            channels.sort(key=lambda c: c in failed_channels, reverse=True)
+        
+        # Process channels in batches for controlled concurrency
+        for i in range(0, len(channels), self.config.max_concurrent_collections):
             if self.stop_event.is_set():
                 logger.info("Stop requested, aborting remaining channel collections")
                 break
-                
-            await self._collect_from_channel(channel)
+            
+            batch = channels[i:i + self.config.max_concurrent_collections]
+            logger.info(f"Processing batch of {len(batch)} channels")
+            
+            # Create tasks for the batch
+            tasks = []
+            for channel in batch:
+                task = asyncio.create_task(
+                    asyncio.wait_for(
+                        self._collect_from_channel(channel),
+                        timeout=self.config.collection_timeout * 60
+                    )
+                )
+                tasks.append(task)
+            
+            # Wait for all tasks in the batch
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process results
+            for channel, result in zip(batch, batch_results):
+                if isinstance(result, Exception):
+                    logger.error(f"Collection failed for {channel}: {result}")
+                    if isinstance(result, asyncio.TimeoutError):
+                        self._handle_task_failure(
+                            f"collect_from_channel:{channel}",
+                            f"channel:{channel}",
+                            f"Collection timed out after {self.config.collection_timeout} minutes"
+                        )
+                    else:
+                        self._handle_task_failure(
+                            f"collect_from_channel:{channel}",
+                            f"channel:{channel}",
+                            str(result)
+                        )
     
     async def _process_retries(self):
         """Process any pending retry attempts."""
@@ -551,18 +615,86 @@ class ArchiveCollectionScheduler:
         Get the current status of the scheduler.
         
         Returns:
-            Dictionary with scheduler status information
+            Dictionary with scheduler status information including:
+            - running state
+            - channel configuration
+            - schedule timing
+            - retry status
+            - task history
+            - collection statistics
         """
-        return {
+        status = {
             'running': self.running,
             'channels': self.config.channels,
-            'collection_interval': self.config.collection_interval,
+            'config': {
+                'collection_interval': self.config.collection_interval,
+                'max_concurrent_collections': self.config.max_concurrent_collections,
+                'collection_timeout': self.config.collection_timeout,
+                'max_retries': self.config.max_retries,
+                'retry_backoff_factor': self.config.retry_backoff_factor,
+                'max_retry_delay': self.config.max_retry_delay
+            },
             'next_run': schedule.next_run().strftime('%Y-%m-%d %H:%M:%S') if self.running else None,
             'pending_retries': len(self.retry_tracker.get_pending_retries()),
             'total_retries': len(self.retry_tracker.get_all_retries()),
-            'task_history': self.task_history[-10:]  # Last 10 tasks
+            'task_history': self.task_history[-10:],  # Last 10 tasks
+            'stats': {
+                'total_collections': stats.counters.get('channels_collected', 0),
+                'total_failures': stats.counters.get('task_failures', 0),
+                'max_retries_reached': stats.counters.get('task_failures_max_retries', 0),
+                'files_found': stats.counters.get('archive_files_found', 0),
+                'files_downloaded': stats.counters.get('archive_files_downloaded', 0)
+            }
         }
+        return status
     
+
+    def get_channel_status(self, channel: str) -> Dict[str, Any]:
+        """
+        Get detailed status for a specific channel.
+        
+        Args:
+            channel: Channel identifier
+            
+        Returns:
+            Dictionary containing channel-specific status information including:
+            - configuration status
+            - collection history
+            - retry status
+            - success/failure statistics
+        """
+        # Get channel-specific task history
+        channel_history = [
+            task for task in self.task_history 
+            if task['task_name'] == f'collect_from_channel:{channel}'
+        ]
+        
+        # Get active retries for channel
+        channel_retries = [
+            retry for retry in self.retry_tracker.get_all_retries()
+            if retry['task_name'] == f'collect_from_channel:{channel}'
+        ]
+        
+        # Calculate success rate
+        total_collections = len(channel_history)
+        successful_collections = len([t for t in channel_history if t['success']])
+        success_rate = (successful_collections / total_collections * 100) if total_collections > 0 else 0
+        
+        return {
+            'configured': channel in self.config.channels,
+            'last_collection': channel_history[-1] if channel_history else None,
+            'collection_history': channel_history[-5:],  # Last 5 collections
+            'pending_retries': channel_retries,
+            'statistics': {
+                'total_collections': total_collections,
+                'successful_collections': successful_collections,
+                'failed_collections': total_collections - successful_collections,
+                'success_rate': f"{success_rate:.1f}%",
+                'current_retry_attempt': channel_retries[0]['attempt_number'] if channel_retries else 0,
+                'next_retry_time': channel_retries[0]['next_attempt'].strftime('%Y-%m-%d %H:%M:%S') if channel_retries else None
+            }
+        }
+
     def get_task_history(self) -> List[Dict[str, Any]]:
         """
         Get the task execution history.

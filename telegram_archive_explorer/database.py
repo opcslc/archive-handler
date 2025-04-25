@@ -7,13 +7,31 @@ using SQLAlchemy ORM. It supports encrypted SQLite databases using SQLCipher.
 
 import logging
 import os
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Union
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Table, Boolean, Index, Text, CheckConstraint
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship, Session, scoped_session
+from sqlalchemy import (
+    create_engine, Column, Integer, String, DateTime, ForeignKey, 
+    Table, Boolean, Index, Text, CheckConstraint, JSON
+)
+
+from sqlalchemy.types import TypeDecorator, JSON as SQLAlchemyJSON
+
+# Type aliases for clarity
+class JSONType(TypeDecorator):
+    """Custom type for JSON columns with proper type hints."""
+    impl = SQLAlchemyJSON
+    
+    def process_bind_param(self, value: Optional[Dict[str, Any]], dialect: Any) -> Optional[Dict[str, Any]]:
+        return value
+    
+    def process_result_value(self, value: Optional[Dict[str, Any]], dialect: Any) -> Optional[Dict[str, Any]]:
+        return value
+from sqlalchemy.orm import (
+    declarative_base, declarative_mixin,
+    sessionmaker, relationship, Session, scoped_session
+)
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import SingletonThreadPool
 
@@ -22,7 +40,12 @@ from .logging_setup import stats
 
 logger = logging.getLogger(__name__)
 
-Base = declarative_base()
+@declarative_mixin
+class BaseMixin:
+    """Base mixin for all models."""
+    pass
+
+Base = declarative_base(cls=BaseMixin, type_annotation_map={Dict[str, Any]: JSONType})
 
 # Association table for many-to-many relationship between URLs and credentials
 url_credential_association = Table(
@@ -32,7 +55,7 @@ url_credential_association = Table(
     Column('credential_id', Integer, ForeignKey('credentials.id'))
 )
 
-class Source(Base):
+class Source(Base):  # type: ignore
     """Model for tracking the source of data."""
     __tablename__ = 'sources'
     
@@ -41,6 +64,9 @@ class Source(Base):
     message_id = Column(Integer, nullable=True)
     file_name = Column(String(255), nullable=True)
     collected_date = Column(DateTime, default=datetime.utcnow)
+    import_date = Column(DateTime, default=datetime.utcnow)
+    import_batch_id = Column(String(36), nullable=True)  # UUID for batch tracking
+    metadata = Column(JSONType, nullable=True)  # For flexible metadata storage
     
     # Relationships
     urls = relationship("URL", back_populates="source")
@@ -49,7 +75,7 @@ class Source(Base):
     def __repr__(self):
         return f"<Source(channel='{self.telegram_channel}', file='{self.file_name}')>"
 
-class URL(Base):
+class URL(Base):  # type: ignore
     """Model for URLs found in data dumps."""
     __tablename__ = 'urls'
     
@@ -95,7 +121,7 @@ class URL(Base):
     def __repr__(self):
         return f"<URL(url='{self.url}')>"
 
-class Credential(Base):
+class Credential(Base):  # type: ignore
     """Model for credentials (username/email and password)."""
     __tablename__ = 'credentials'
     
@@ -151,6 +177,32 @@ class Credential(Base):
         else:
             user = self.username
         return f"<Credential(user='{user}', password='***')>"
+
+class ImportLog(Base):  # type: ignore
+    """Model for tracking import operations and their statistics."""
+    __tablename__ = 'import_logs'
+    
+    id = Column(Integer, primary_key=True)
+    batch_id = Column(String(36), nullable=False, index=True)  # UUID for batch tracking
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=True)
+    total_records = Column(Integer, default=0)
+    imported_records = Column(Integer, default=0)
+    duplicate_records = Column(Integer, default=0)
+    error_records = Column(Integer, default=0)
+    skipped_records = Column(Integer, default=0)
+    source_id = Column(Integer, ForeignKey('sources.id'))
+    
+    # Statistics and metadata
+    error_details = Column(JSONType, nullable=True)  # Store error messages and counts
+    skipped_details = Column(JSONType, nullable=True)  # Store skip reasons and counts
+    metadata = Column(JSONType, nullable=True)  # Additional import metadata
+    
+    # Relationships
+    source = relationship("Source", backref="import_logs")
+    
+    def __repr__(self):
+        return f"<ImportLog(batch='{self.batch_id}', imported={self.imported_records}, errors={self.error_records})>"
 
 class Database:
     """Database manager class."""
